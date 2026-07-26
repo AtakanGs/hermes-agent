@@ -3641,9 +3641,9 @@ def check_execute_code_guard(code: str, env_type: str,
     execute_code runs arbitrary local Python — the script can call
     ``subprocess``, ``os.system``, ``ctypes``, or other process/file APIs
     directly, none of which pass through ``terminal()`` /
-    ``DANGEROUS_PATTERNS``. In gateway/ask contexts we fail closed by approving
-    the script as a whole before it runs (#30882). Returns the same dict
-    contract as ``check_all_command_guards``.
+    ``DANGEROUS_PATTERNS``. In interactive CLI, gateway, and ask contexts
+    we fail closed by approving the script as a whole before it runs (#30882).
+    Returns the same dict contract as ``check_all_command_guards``.
 
     Scope (documented limitation, #30882): in a purely local non-interactive
     non-gateway session (no TTY, not gateway, not cron-deny) this returns
@@ -3657,7 +3657,7 @@ def check_execute_code_guard(code: str, env_type: str,
     description = (
         "execute_code script execution. The script can spawn subprocesses or "
         "mutate files without passing through terminal command approval; "
-        "approval is one-shot for this run."
+        "the whole script must pass the approval gate before it runs."
     )
 
     # Isolated backends already sandbox the child — matches the container skip
@@ -3676,6 +3676,7 @@ def check_execute_code_guard(code: str, env_type: str,
 
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
+    is_cli = _is_interactive_cli()
 
     # Cron: no user is present to approve arbitrary code.
     if env_var_enabled("HERMES_CRON_SESSION"):
@@ -3697,12 +3698,11 @@ def check_execute_code_guard(code: str, env_type: str,
             }
         return {"approved": True, "message": None}
 
-    # Only gateway/ask contexts get the one-shot whole-script approval.
-    #   * CLI interactive: the script's terminal() calls are guarded per-call
-    #     (context now propagates into the RPC thread, #33057); a whole-script
-    #     prompt would fire on every execute_code call.
-    #   * Local non-interactive non-gateway: documented limitation above.
-    if not is_gateway and not is_ask:
+    # Human-present surfaces approve the whole script because direct Python
+    # process/file APIs never pass through terminal() or its per-command guard.
+    # Purely local non-interactive sessions retain the documented trusted-by-config
+    # behavior because they have no approval surface.
+    if not is_gateway and not is_ask and not is_cli:
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
@@ -3735,7 +3735,7 @@ def check_execute_code_guard(code: str, env_type: str,
                          session_key)
             return {"approved": True, "message": None,
                     "smart_approved": True, "description": description}
-        if verdict == "deny" and not (is_gateway or is_ask):
+        if verdict == "deny" and (is_cli or not (is_gateway or is_ask)):
             return {
                 "approved": False,
                 "message": ("BLOCKED by smart approval: execute_code script "
@@ -3762,6 +3762,78 @@ def check_execute_code_guard(code: str, env_type: str,
     display_command = redact_sensitive_text(command)
     display_code = redact_sensitive_text(code)
     display_description = redact_sensitive_text(description)
+
+    if is_cli:
+        # execute_code is invoked outside terminal_tool's wrapper, so pull the
+        # thread-local CLI callback explicitly. This preserves prompt_toolkit
+        # routing and ACP session isolation instead of falling back to input().
+        try:
+            from tools.terminal_tool import _get_approval_callback
+
+            approval_callback = _get_approval_callback()
+        except Exception:
+            approval_callback = None
+
+        _fire_approval_hook(
+            "pre_approval_request",
+            command=display_command,
+            description=display_description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="cli",
+        )
+        choice = prompt_dangerous_approval(
+            command,
+            description,
+            allow_permanent=not smart_denied_for_owner,
+            approval_callback=approval_callback,
+            smart_denied=smart_denied_for_owner,
+        )
+        _fire_approval_hook(
+            "post_approval_response",
+            command=display_command,
+            description=display_description,
+            pattern_key=pattern_key,
+            pattern_keys=[pattern_key],
+            session_key=session_key,
+            surface="cli",
+            choice=choice,
+        )
+
+        allowed_choices = (
+            {"once"}
+            if smart_denied_for_owner
+            else {"once", "session", "always"}
+        )
+        if choice not in allowed_choices:
+            return {
+                "approved": False,
+                "message": (
+                    "BLOCKED: User denied execute_code script execution. The user "
+                    "has NOT consented to running this code. Do NOT retry, do NOT "
+                    "rephrase the script, and do NOT attempt the same outcome via "
+                    "a different tool."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+                "outcome": "denied",
+                "user_consent": False,
+            }
+
+        if choice == "session":
+            approve_session(session_key, pattern_key)
+        elif choice == "always":
+            approve_session(session_key, pattern_key)
+            approve_permanent(pattern_key)
+            save_permanent_allowlist(_permanent_approved)
+
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+            "description": description,
+        }
 
     notify_cb = None
     with _lock:

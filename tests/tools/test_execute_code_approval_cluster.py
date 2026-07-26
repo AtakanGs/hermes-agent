@@ -177,6 +177,143 @@ def test_guard_headless_local_approved(monkeypatch):
     assert A.check_execute_code_guard("import os", "local")["approved"] is True
 
 
+@pytest.fixture
+def cli_session(monkeypatch):
+    """Interactive CLI context with isolated approval state and callback."""
+    from tools import terminal_tool as TT
+
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+
+    interactive_token = A.set_hermes_interactive_context(True)
+    session_key = "cluster-cli-session"
+    session_token = A.set_current_session_key(session_key)
+    previous_callback = TT._get_approval_callback()
+    TT.set_approval_callback(None)
+    with A._lock:
+        A._session_approved.pop(session_key, None)
+        was_permanently_approved = "execute_code" in A._permanent_approved
+        A._permanent_approved.discard("execute_code")
+
+    try:
+        yield session_key, TT
+    finally:
+        TT.set_approval_callback(previous_callback)
+        with A._lock:
+            A._session_approved.pop(session_key, None)
+            if was_permanently_approved:
+                A._permanent_approved.add("execute_code")
+        A.reset_current_session_key(session_token)
+        A.reset_hermes_interactive_context(interactive_token)
+
+
+def test_guard_cli_smart_deny_does_not_prompt_for_override(
+    cli_session, monkeypatch
+):
+    _session_key, terminal_tool = cli_session
+    prompt_calls = []
+
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(A, "_smart_approve", lambda *_args: "deny")
+    terminal_tool.set_approval_callback(
+        lambda *_args, **_kwargs: prompt_calls.append(True) or "once"
+    )
+
+    result = A.check_execute_code_guard(
+        'import subprocess; subprocess.run(["rm", "-rf", "/tmp/project"])',
+        "local",
+    )
+
+    assert result["approved"] is False
+    assert result["smart_denied"] is True
+    assert result["outcome"] == "denied"
+    assert prompt_calls == []
+
+
+def test_guard_cli_user_denies_whole_script(cli_session):
+    _session_key, terminal_tool = cli_session
+    seen = {}
+
+    def deny(command, description, **kwargs):
+        seen.update(command=command, description=description, kwargs=kwargs)
+        return "deny"
+
+    terminal_tool.set_approval_callback(deny)
+    result = A.check_execute_code_guard(
+        'import subprocess; subprocess.run(["rm", "-rf", "/tmp/project"])',
+        "local",
+    )
+
+    assert result["approved"] is False
+    assert result["outcome"] == "denied"
+    assert result["user_consent"] is False
+    assert "subprocess.run" in seen["command"]
+    assert seen["kwargs"]["allow_permanent"] is True
+
+
+def test_execute_code_cli_denial_prevents_child_spawn(cli_session, monkeypatch):
+    _session_key, terminal_tool = cli_session
+    from tools import code_execution_tool as CET
+
+    terminal_tool.set_approval_callback(lambda *_args, **_kwargs: "deny")
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {"env_type": "local"},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_docker_has_host_access",
+        lambda _config: False,
+    )
+
+    def unexpected_spawn(*_args, **_kwargs):
+        raise AssertionError("execute_code spawned a child after CLI denial")
+
+    monkeypatch.setattr(CET.subprocess, "Popen", unexpected_spawn)
+    result = json.loads(
+        CET.execute_code(
+            'import subprocess; subprocess.run(["rm", "-rf", "/tmp/project"])'
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "denied" in result["error"].lower()
+    assert result["tool_calls_made"] == 0
+
+
+def test_guard_cli_user_approves_once(cli_session):
+    session_key, terminal_tool = cli_session
+    terminal_tool.set_approval_callback(lambda *_args, **_kwargs: "once")
+
+    result = A.check_execute_code_guard("print('safe')", "local")
+
+    assert result["approved"] is True
+    assert result["user_approved"] is True
+    assert A.is_approved(session_key, "execute_code") is False
+
+
+def test_guard_cli_session_approval_skips_future_prompt(cli_session):
+    session_key, terminal_tool = cli_session
+    calls = []
+
+    def approve_session_choice(*_args, **_kwargs):
+        calls.append(True)
+        return "session"
+
+    terminal_tool.set_approval_callback(approve_session_choice)
+    first = A.check_execute_code_guard("print(1)", "local")
+    second = A.check_execute_code_guard("print(2)", "local")
+
+    assert first["approved"] is True
+    assert second["approved"] is True
+    assert A.is_approved(session_key, "execute_code") is True
+    assert len(calls) == 1
+
+
 def test_guard_cron_deny_blocks(monkeypatch):
     monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
